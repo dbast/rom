@@ -76,6 +76,13 @@ summary. As in nix-output-monitor, producer controls are preserved without
 classification and are emitted with the pending logs inside the next atomic
 graph commit. ROM uses the normal screen and preserves scrollback.
 
+Supporting terminals also receive OSC 9;4 progress reports. Percentages count
+completed builds against Nix's expected builds, not elapsed time or transfer
+bytes. Before totals are known, and when counted builds finish while other work
+continues, the indicator is indeterminate. Reports are independent of ANSI
+color and excluded for redirected output, `TERM=dumb`, tmux, GNU Screen, and
+`--silent`. The CLI clears its indicator on completion or handled cancellation.
+
 The live tree reserves its bottom rows for the selected legend and limits the
 dependency graph above it to two-thirds of the usable terminal height. It
 budgets connected activity branches before individual transfer details, so a
@@ -93,7 +100,15 @@ The keys are the same as the command line options, e.g.:
 ```toml
 log-prefix = "short"
 log-lines = 20
+progress = "auto" # auto, always, or never
 ```
+
+`--progress always` enables reporting without terminal-brand detection, useful
+over SSH; `--progress never` disables it. CLI flags override config values.
+In `auto` mode, `ROM_PROGRESS` overrides detection: `1`, `true`, or `always`
+enable reporting; `0`, `false`, or `never` disable it; `auto` keeps detection.
+Other values are errors. Explicit `always`/`never` settings take precedence over
+the environment. Terminal and silent-mode exclusions still apply.
 
 ## Library
 
@@ -117,6 +132,13 @@ the tracing subscriber, and Unix process-signal dependencies.
 passthrough lines. `Monitor` is the append-only `BufRead`/`Write` convenience
 adapter. Build-history storage and `.drv` resolution are optional injected
 services; the CLI supplies filesystem-backed implementations.
+
+OSC progress lives in the shared `LiveTerminal` renderer, so nh's rom-based
+integration inherits reporting after a dependency update. Embedding applications
+must handle signals themselves if they need cleanup on abrupt cancellation;
+the rom CLI's signal handling does not propagate into nh. `RenderConfig` now
+includes `progress`; consumers with exhaustive struct literals must add that
+field, while constructions using `..RenderConfig::default()` remain compatible.
 
 ## Reproducible visual fixtures
 

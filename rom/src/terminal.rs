@@ -2,9 +2,14 @@
 
 use std::{
   io::{self, IsTerminal, Write},
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
   time::{Duration, Instant},
 };
 
+use anstyle_progress::TermProgress;
 use crossterm::{
   cursor::{Hide, MoveToColumn, MoveToPreviousLine, Show},
   queue,
@@ -14,7 +19,7 @@ use crossterm::{
 use crate::{
   display::{MIN_TREE_WIDTH, render_frame, write_final},
   state::{State, elapsed},
-  types::{DisplayFormat, RenderConfig},
+  types::{DisplayFormat, ProgressMode, RenderConfig},
 };
 
 const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
@@ -72,21 +77,36 @@ fn count_lines(bytes: &[u8]) -> usize {
 }
 
 /// Owns the live graph region and serializes all terminal output.
+///
+/// OSC 9;4 progress is automatically enabled on supported direct stderr
+/// terminals. `RenderConfig::progress` selects auto, always, or never; in auto
+/// mode `ROM_PROGRESS` overrides detection (1/true/always or 0/false/never).
+/// This permits enabling over SSH. Pipes, `TERM=dumb`,
+/// and multiplexers are excluded. Progress is independent of ANSI colors.
 #[expect(
   clippy::struct_excessive_bools,
   reason = "the flags are independent lifecycle facts"
 )]
 pub struct LiveTerminal<W: Write> {
-  writer:        W,
-  graph_height:  u16,
-  initialized:   bool,
-  retired:       bool,
-  finished:      bool,
-  pending:       Vec<u8>,
-  partial_line:  bool,
-  partial_since: Option<f64>,
-  frame:         String,
-  frame_cost:    Duration,
+  writer:               W,
+  graph_height:         u16,
+  initialized:          bool,
+  retired:              bool,
+  finished:             bool,
+  pending:              Vec<u8>,
+  partial_line:         bool,
+  partial_since:        Option<f64>,
+  frame:                String,
+  frame_cost:           Duration,
+  progress_enabled:     Option<bool>,
+  progress:             Option<ProgressIndicator>,
+  progress_outstanding: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressIndicator {
+  Indeterminate,
+  Percent(u8),
 }
 
 impl<W: Write> LiveTerminal<W> {
@@ -104,7 +124,15 @@ impl<W: Write> LiveTerminal<W> {
       partial_since: None,
       frame: String::new(),
       frame_cost: Duration::ZERO,
+      progress_enabled: None,
+      progress: None,
+      progress_outstanding: None,
     }
+  }
+
+  #[cfg(feature = "cli")]
+  pub(crate) fn track_progress(&mut self, outstanding: Arc<AtomicBool>) {
+    self.progress_outstanding = Some(outstanding);
   }
 
   /// Returns whether live rendering has stopped for good.
@@ -136,6 +164,7 @@ impl<W: Write> LiveTerminal<W> {
     now: f64,
     final_render: bool,
   ) -> io::Result<bool> {
+    self.update_progress(state, config, final_render)?;
     if self.retired {
       return Ok(false);
     }
@@ -202,6 +231,70 @@ impl<W: Write> LiveTerminal<W> {
     }
     self.retire()?;
     Ok(false)
+  }
+
+  fn update_progress(
+    &mut self,
+    state: &State,
+    config: &RenderConfig,
+    final_render: bool,
+  ) -> io::Result<()> {
+    if final_render || self.finished {
+      return self.clear_progress();
+    }
+    if self.progress_enabled.is_none() {
+      let mode = config.progress.resolve()?;
+      // Environment hints may be absent over SSH; an override still requires
+      // a direct terminal, never a pipe or unvalidated multiplexer.
+      self.progress_enabled = Some(
+        admission() == Admission::Live
+          && std::env::var("TERM").as_deref() != Ok("dumb")
+          && match mode {
+            ProgressMode::Never => false,
+            ProgressMode::Always => true,
+            ProgressMode::Auto => {
+              anstyle_progress::supports_term_progress(true)
+            },
+          },
+      );
+    }
+    if self.progress_enabled != Some(true) {
+      return Ok(());
+    }
+    let builds = state.builds_progress();
+    // This measures completed builds, not elapsed work. Return to busy when
+    // builds finish but Nix is still transferring or doing other work.
+    let percent =
+      (builds.expected > 0 && builds.done < builds.expected).then(|| {
+        ((u128::from(builds.done) * 100) / u128::from(builds.expected)) as u8
+      });
+    let indicator = percent
+      .map_or(ProgressIndicator::Indeterminate, ProgressIndicator::Percent);
+    if self.progress == Some(indicator) {
+      return Ok(());
+    }
+    // TermProgress formats OSC 9;4, terminated by ST (ESC backslash).
+    let report = percent.map_or_else(TermProgress::start, |value| {
+      TermProgress::start().percent(value)
+    });
+    write!(self.writer, "{report}")?;
+    self.progress = Some(indicator);
+    if let Some(outstanding) = &self.progress_outstanding {
+      outstanding.store(true, Ordering::SeqCst);
+    }
+    self.writer.flush()
+  }
+
+  fn clear_progress(&mut self) -> io::Result<()> {
+    if self.progress.is_some() {
+      write!(self.writer, "{}", TermProgress::remove())?;
+      self.progress = None;
+      self.writer.flush()?;
+      if let Some(outstanding) = &self.progress_outstanding {
+        outstanding.store(false, Ordering::SeqCst);
+      }
+    }
+    Ok(())
   }
 
   fn compose(&self, logs: &[u8], frame: &str) -> io::Result<Vec<u8>> {
@@ -327,6 +420,7 @@ impl<W: Write> LiveTerminal<W> {
   ///
   /// Returns an error if writing to the terminal fails.
   pub fn finish(&mut self) -> io::Result<()> {
+    self.clear_progress()?;
     if self.finished {
       return Ok(());
     }
@@ -379,6 +473,7 @@ const fn live_geometry(columns: u16, rows: u16) -> bool {
 
 impl<W: Write> Drop for LiveTerminal<W> {
   fn drop(&mut self) {
+    let _ = self.clear_progress();
     if !self.finished && !self.retired {
       let _ = self.retire();
     }
@@ -399,6 +494,85 @@ impl<W: Write> Write for LiveTerminal<W> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn progress_starts_busy_deduplicates_and_clears_after_builds() {
+    let mut terminal = LiveTerminal::new(Vec::<u8>::new());
+    terminal.progress_enabled = Some(true);
+    let mut stream =
+      crate::monitor::StreamEngine::new(crate::types::EngineConfig::default());
+    terminal
+      .update_progress(stream.engine().state(), &RenderConfig::default(), false)
+      .unwrap();
+    terminal
+      .update_progress(stream.engine().state(), &RenderConfig::default(), false)
+      .unwrap();
+    assert_eq!(terminal.writer, b"\x1b]9;4;3;\x1b\\");
+
+    stream.push_at(b"@nix {\"action\":\"start\",\"id\":1,\"level\":3,\"parent\":0,\"text\":\"\",\"type\":104,\"fields\":[]}\n@nix {\"action\":\"result\",\"id\":1,\"type\":105,\"fields\":[1,4,1,0]}\n", 0.0).unwrap();
+    terminal
+      .update_progress(stream.engine().state(), &RenderConfig::default(), false)
+      .unwrap();
+    terminal
+      .update_progress(stream.engine().state(), &RenderConfig::default(), false)
+      .unwrap();
+    assert_eq!(count(&terminal.writer, b"\x1b]9;4;1;25\x1b\\"), 1);
+
+    stream.push_at(b"@nix {\"action\":\"result\",\"id\":1,\"type\":105,\"fields\":[4,4,0,0]}\n", 1.0).unwrap();
+    terminal
+      .update_progress(stream.engine().state(), &RenderConfig::default(), false)
+      .unwrap();
+    assert!(terminal.writer.ends_with(b"\x1b]9;4;3;\x1b\\"));
+    terminal
+      .update_progress(stream.engine().state(), &RenderConfig::default(), true)
+      .unwrap();
+    terminal.finish().unwrap();
+    assert_eq!(count(&terminal.writer, b"\x1b]9;4;0;\x1b\\"), 1);
+  }
+
+  #[test]
+  fn progress_survives_graph_retirement_and_clears_on_drop() {
+    let mut bytes = Vec::new();
+    let mut terminal = LiveTerminal::new(&mut bytes);
+    terminal.progress_enabled = Some(true);
+    terminal.retire().unwrap();
+    terminal
+      .render(&State::new(), &RenderConfig::default(), 0.0, false)
+      .unwrap();
+    drop(terminal);
+    assert_eq!(bytes, b"\x1b]9;4;3;\x1b\\\x1b]9;4;0;\x1b\\");
+  }
+
+  #[test]
+  fn disabled_progress_emits_nothing() {
+    let mut terminal = LiveTerminal::new(Vec::<u8>::new());
+    terminal.progress_enabled = Some(false);
+    terminal
+      .update_progress(&State::new(), &RenderConfig::default(), false)
+      .unwrap();
+    terminal.finish().unwrap();
+    assert_eq!(terminal.writer, b"");
+  }
+
+  #[cfg(feature = "cli")]
+  #[test]
+  fn cancellation_tracks_only_this_renderers_outstanding_report() {
+    let outstanding = Arc::new(AtomicBool::new(false));
+    let mut terminal = LiveTerminal::new(Vec::<u8>::new());
+    terminal.track_progress(Arc::clone(&outstanding));
+    terminal.progress_enabled = Some(false);
+    terminal
+      .update_progress(&State::new(), &RenderConfig::default(), false)
+      .unwrap();
+    assert!(!outstanding.load(Ordering::SeqCst));
+    terminal.progress_enabled = Some(true);
+    terminal
+      .update_progress(&State::new(), &RenderConfig::default(), false)
+      .unwrap();
+    assert!(outstanding.load(Ordering::SeqCst));
+    terminal.finish().unwrap();
+    assert!(!outstanding.load(Ordering::SeqCst));
+  }
 
   #[test]
   fn frame_commit_is_one_synchronized_full_repaint() {

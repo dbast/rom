@@ -129,6 +129,68 @@ pub enum IconMode {
   Nerd,
 }
 
+/// Terminal progress reporting (OSC 9;4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "cli", derive(pound::ValueEnum, serde::Deserialize))]
+#[cfg_attr(feature = "cli", serde(rename_all = "kebab-case"))]
+pub enum ProgressMode {
+  /// Detect support, unless overridden by `ROM_PROGRESS`.
+  #[default]
+  Auto,
+  /// Report on direct terminals without brand detection.
+  Always,
+  /// Never report terminal progress.
+  Never,
+}
+
+impl ProgressMode {
+  pub(crate) fn resolve(self) -> std::io::Result<Self> {
+    if self != Self::Auto {
+      return Ok(self);
+    }
+    match std::env::var("ROM_PROGRESS") {
+      Ok(value) => Self::from_env(&value),
+      Err(std::env::VarError::NotPresent) => Ok(Self::Auto),
+      Err(error) => {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+      },
+    }
+  }
+
+  fn from_env(value: &str) -> std::io::Result<Self> {
+    match value {
+      "auto" => Ok(Self::Auto),
+      "1" | "true" | "always" => Ok(Self::Always),
+      "0" | "false" | "never" => Ok(Self::Never),
+      _ => {
+        Err(std::io::Error::new(
+          std::io::ErrorKind::InvalidInput,
+          "ROM_PROGRESS must be auto, 1/true/always, or 0/false/never",
+        ))
+      },
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ProgressMode;
+
+  #[test]
+  fn progress_environment_values_are_explicit() {
+    for value in ["1", "true", "always"] {
+      assert_eq!(ProgressMode::from_env(value).unwrap(), ProgressMode::Always);
+    }
+    for value in ["0", "false", "never"] {
+      assert_eq!(ProgressMode::from_env(value).unwrap(), ProgressMode::Never);
+    }
+    assert_eq!(ProgressMode::from_env("auto").unwrap(), ProgressMode::Auto);
+    for value in ["", "off", "no", "interrupt"] {
+      ProgressMode::from_env(value).unwrap_err();
+    }
+  }
+}
+
 impl Default for Theme {
   fn default() -> Self {
     Self {
@@ -194,6 +256,8 @@ pub struct RenderConfig {
   pub theme:         Theme,
   /// Icon selection.
   pub icons:         IconMode,
+  /// OSC 9;4 reporting, independent of ANSI styling.
+  pub progress:      ProgressMode,
 }
 
 impl Default for EngineConfig {
@@ -221,6 +285,7 @@ impl Default for RenderConfig {
       summary_style: SummaryStyle::Concise,
       theme:         Theme::default(),
       icons:         IconMode::Nerd,
+      progress:      ProgressMode::Auto,
     }
   }
 }

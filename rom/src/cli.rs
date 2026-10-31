@@ -1,5 +1,6 @@
 //! Command-line interface and Nix/Lix process adapters.
 
+#[cfg(unix)] use std::sync::atomic::AtomicI32;
 use std::{
   collections::HashSet,
   env::{self, VarError},
@@ -46,6 +47,7 @@ use crate::{
     InputMode,
     LegendStyle,
     LogPrefixStyle,
+    ProgressMode,
     RenderConfig,
     SummaryStyle,
   },
@@ -102,6 +104,10 @@ pub struct DisplayOptions {
   #[pound(long, global)]
   pub icons: Option<IconMode>,
 
+  /// Terminal progress: auto, always, or never.
+  #[pound(long, global)]
+  pub progress: Option<ProgressMode>,
+
   /// Builder-log prefix. Defaults to short.
   #[pound(long, global)]
   pub log_prefix: Option<LogPrefixStyle>,
@@ -119,6 +125,7 @@ impl DisplayOptions {
       legend:     self.legend.or(file.legend),
       summary:    self.summary.or(file.summary),
       icons:      self.icons.or(file.icons),
+      progress:   self.progress.or(file.progress),
       log_prefix: self.log_prefix.or(file.log_prefix),
       log_lines:  self.log_lines.or(file.log_lines),
     }
@@ -263,6 +270,7 @@ pub fn run() -> misstep::Result<ExitCode> {
       legend_style: cli.display.legend.unwrap_or_default(),
       summary_style: cli.display.summary.unwrap_or_default(),
       icons: cli.display.icons.unwrap_or_default(),
+      progress: cli.display.progress.unwrap_or_default().resolve()?,
       ..RenderConfig::default()
     },
   };
@@ -280,7 +288,7 @@ pub fn run() -> misstep::Result<ExitCode> {
     ) if packages.is_empty()
       && config.monitor.engine.input_mode == InputMode::Json =>
     {
-      run_input(io::stdin(), config.monitor).map(|()| ExitCode::SUCCESS)
+      run_input(io::stdin(), config.monitor)
     },
     Some(Commands::Build {
       packages,
@@ -297,7 +305,7 @@ pub fn run() -> misstep::Result<ExitCode> {
     Some(Commands::Other(External { name, args, .. })) => {
       other(name, args, &config)
     },
-    None => run_input(io::stdin(), config.monitor).map(|()| ExitCode::SUCCESS),
+    None => run_input(io::stdin(), config.monitor),
   }
 }
 
@@ -506,8 +514,12 @@ fn run_monitored_command(
     .spawn()
     .with_context(|| format!("running {program}"))?;
 
+  let progress_outstanding = Arc::new(AtomicBool::new(false));
   #[cfg(unix)]
-  let signal_forwarder = SignalForwarder::start(child.id())?;
+  let signal_forwarder = SignalForwarder::start(
+    Some(child.id()),
+    Arc::clone(&progress_outstanding),
+  )?;
 
   #[cfg(unix)]
   let interrupted = Arc::clone(&signal_forwarder.interrupted);
@@ -534,6 +546,7 @@ fn run_monitored_command(
     false,
     &interrupted,
     builds.then_some(&mut child),
+    progress_outstanding,
   );
   if result.is_err() {
     terminate_process(&mut child);
@@ -542,9 +555,6 @@ fn run_monitored_command(
   let status = child
     .wait()
     .with_context(|| format!("waiting for {program}"))?;
-
-  #[cfg(unix)]
-  signal_forwarder.stop();
 
   reader_thread
     .join()
@@ -583,38 +593,53 @@ fn terminate_process(child: &mut Child) {
 struct SignalForwarder {
   handle:      signal_hook::iterator::Handle,
   interrupted: Arc<AtomicBool>,
-  _thread:     thread::JoinHandle<()>,
+  signal:      Arc<AtomicI32>,
+  thread:      Option<thread::JoinHandle<()>>,
 }
 
 #[cfg(unix)]
 impl SignalForwarder {
-  #[expect(
-    clippy::semicolon_outside_block,
-    reason = "semicolon_inside_block asks for the opposite"
-  )]
-  fn start(process_group: u32) -> io::Result<Self> {
+  fn start(
+    process_group: Option<u32>,
+    progress_outstanding: Arc<AtomicBool>,
+  ) -> io::Result<Self> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     let mut signals =
       signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
     let handle = signals.handle();
     let interrupted = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&interrupted);
+    let first_signal = Arc::new(AtomicI32::new(0));
+    let received = Arc::clone(&first_signal);
     let thread = thread::spawn(move || {
       for signal in signals.forever() {
         // A second signal arrives when the first did not end rom quickly
         // enough, so it stops everything instead of being forwarded again.
-        let repeated = seen.swap(true, Ordering::SeqCst);
-        // SAFETY: the child was spawned as the leader of this process group.
-        unsafe {
-          libc::kill(
-            -(process_group as i32),
-            if repeated { libc::SIGKILL } else { signal },
-          );
+        let repeated = received
+          .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst)
+          .is_err();
+        seen.store(true, Ordering::SeqCst);
+        if let Some(process_group) = process_group {
+          // SAFETY: the child was spawned as the leader of this process group.
+          unsafe {
+            libc::kill(
+              -(process_group as i32),
+              if repeated { libc::SIGKILL } else { signal },
+            );
+          }
         }
         if repeated {
           // exit skips the live view's teardown, which shows the cursor again
           if io::stderr().is_terminal() {
             let _ = crossterm::execute!(io::stderr(), crossterm::cursor::Show);
+            if progress_outstanding.swap(false, Ordering::SeqCst) {
+              let _ = write!(
+                io::stderr(),
+                "{}",
+                anstyle_progress::TermProgress::remove()
+              );
+              let _ = io::stderr().flush();
+            }
           }
           std::process::exit(128 + signal);
         }
@@ -623,26 +648,55 @@ impl SignalForwarder {
     Ok(Self {
       handle,
       interrupted,
-      _thread: thread,
+      signal: first_signal,
+      thread: Some(thread),
     })
   }
+}
 
-  fn stop(self) {
+#[cfg(unix)]
+impl Drop for SignalForwarder {
+  fn drop(&mut self) {
     self.handle.close();
+    if let Some(thread) = self.thread.take() {
+      let _ = thread.join();
+    }
   }
 }
 
 fn run_input<R: Read + Send + 'static>(
   reader: R,
   config: Config,
-) -> misstep::Result<()> {
+) -> misstep::Result<ExitCode> {
+  let progress_outstanding = Arc::new(AtomicBool::new(false));
+  #[cfg(unix)]
+  let signals =
+    SignalForwarder::start(None, Arc::clone(&progress_outstanding))?;
+  #[cfg(unix)]
+  let interrupted = Arc::clone(&signals.interrupted);
+  #[cfg(not(unix))]
+  let interrupted = Arc::new(AtomicBool::new(false));
   let (receiver, reader_thread) = byte_reader(reader);
-  drive(&receiver, config, true, &AtomicBool::new(false), None)?;
+  drive(
+    &receiver,
+    config,
+    true,
+    &interrupted,
+    None,
+    progress_outstanding,
+  )?;
+  #[cfg(unix)]
+  {
+    let signal = signals.signal.load(Ordering::SeqCst);
+    if signal != 0 {
+      return Ok(exit_code(128 + signal));
+    }
+  }
   reader_thread
     .join()
     .map_err(|_| misstep::report!("input reader panicked"))?
     .context("reading standard input")?;
-  Ok(())
+  Ok(ExitCode::SUCCESS)
 }
 
 fn byte_reader<R: Read + Send + 'static>(
@@ -683,11 +737,13 @@ enum Presenter {
 }
 
 impl Presenter {
-  fn new(silent: bool) -> Self {
+  fn new(silent: bool, progress_outstanding: Arc<AtomicBool>) -> Self {
     let admission = crate::terminal::admission();
     tracing::debug!(?admission, silent, "selected terminal presenter");
     if !silent && matches!(admission, Admission::Live) {
-      Self::Live(LiveTerminal::new(io::stderr()))
+      let mut terminal = LiveTerminal::new(io::stderr());
+      terminal.track_progress(progress_outstanding);
+      Self::Live(terminal)
     } else if !silent && !matches!(admission, Admission::NotATerminal) {
       Self::Fallback {
         writer:            io::stderr(),
@@ -830,6 +886,7 @@ fn watch(
   presenter: &mut Presenter,
   render: &RenderConfig,
   silent: bool,
+  interrupted: Option<&AtomicBool>,
 ) -> misstep::Result<()> {
   let rendered =
     !silent && presenter.render_initial(stream, render, current_time())?;
@@ -858,6 +915,9 @@ fn watch(
     dirty |= stream.engine_mut().poll_lookups(time);
     dirty |= stream.engine_mut().sample_usage(time);
 
+    if interrupted.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+      return Ok(());
+    }
     let timer_due = now - last_timer >= Duration::from_secs(1);
     // Animated build and transfer bars need redraws even while Nix is quiet.
     let animating = stream.engine().state().has_unfinished();
@@ -885,6 +945,7 @@ fn drive(
   semantic_failure_is_error: bool,
   interrupted: &AtomicBool,
   child: Option<&mut Child>,
+  progress_outstanding: Arc<AtomicBool>,
 ) -> misstep::Result<()> {
   let Config { engine, render } = config;
   let silent = engine.silent;
@@ -910,8 +971,15 @@ fn drive(
     stream.engine_mut().set_usage(usage);
   }
 
-  let mut presenter = Presenter::new(silent);
-  watch(receiver, &mut stream, &mut presenter, &render, silent)?;
+  let mut presenter = Presenter::new(silent, progress_outstanding);
+  watch(
+    receiver,
+    &mut stream,
+    &mut presenter,
+    &render,
+    silent,
+    child.is_none().then_some(interrupted),
+  )?;
 
   let final_output = stream.finish_at(current_time())?;
   presenter.output(final_output.output, &render)?;
@@ -940,7 +1008,10 @@ fn drive(
   if semantic_failure_is_error && stream.engine().state().has_errors() {
     misstep::bail!(RomError::BuildFailed);
   }
-  if semantic_failure_is_error && stream.engine().state().has_unfinished() {
+  if semantic_failure_is_error
+    && !interrupted.load(Ordering::SeqCst)
+    && stream.engine().state().has_unfinished()
+  {
     misstep::bail!(RomError::Incomplete);
   }
   Ok(())

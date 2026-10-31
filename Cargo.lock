@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "anstyle-progress"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "082ebe8b7607a68881fbcccc7b3a3e784aa58593ed4261df0679a803fdb80853"
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -544,6 +550,7 @@ dependencies = [
 name = "rom"
 version = "0.3.3"
 dependencies = [
+ "anstyle-progress",
  "cognos",
  "crossterm",
  "csv",

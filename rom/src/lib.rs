@@ -38,6 +38,7 @@ pub use types::{
   LegendStyle,
   LogLine,
   LogPrefixStyle,
+  ProgressMode,
   RenderConfig,
   SummaryStyle,
   Theme,

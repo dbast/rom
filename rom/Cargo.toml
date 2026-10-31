@@ -27,6 +27,7 @@ cli = [
 
 [dependencies]
 cognos.workspace = true
+anstyle-progress.workspace = true
 
 pound = { workspace = true, optional = true }
 serde.workspace = true

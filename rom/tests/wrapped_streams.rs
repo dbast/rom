@@ -29,12 +29,14 @@ fn wrapped_stdout_is_exact_and_child_status_is_authoritative() {
     .args(["--platform", "nix", "build", "example"])
     .env("PATH", directory.path())
     .env("XDG_STATE_HOME", directory.path())
+    .env("ROM_PROGRESS", "1")
     .output()
     .unwrap();
 
   assert_eq!(output.stdout, b"/nix/store/exact-without-newline");
   assert_eq!(output.status.code(), Some(7));
   assert!(String::from_utf8_lossy(&output.stderr).contains("from child"));
+  assert!(!output.stderr.windows(6).any(|bytes| bytes == b"\x1b]9;4;"));
 }
 
 #[test]
